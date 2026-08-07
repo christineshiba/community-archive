@@ -54,31 +54,95 @@ ALTER FUNCTION "private"."queue_update_conversation_ids"() OWNER TO "postgres";
 -- Update updated_at and track opt-in/out timestamps on optin table
 CREATE OR REPLACE FUNCTION "public"."update_optin_updated_at"() RETURNS "trigger"
     LANGUAGE "plpgsql"
+    SET "search_path" TO ''
     AS $$
 BEGIN
     NEW.updated_at = NOW();
-    
-    -- Track opt-in/opt-out timestamps
-    IF OLD.opted_in = false AND NEW.opted_in = true THEN
+
+    -- Inserts have no OLD row, so initialize state timestamps explicitly.
+    IF TG_OP = 'INSERT' THEN
+        IF NEW.explicit_optout IS TRUE THEN
+            NEW.opted_in = false;
+            NEW.opted_out_at = NOW();
+        ELSIF NEW.opted_in IS TRUE THEN
+            NEW.opted_in_at = NOW();
+            NEW.opted_out_at = NULL;
+            NEW.explicit_optout = false;
+            NEW.opt_out_reason = NULL;
+        END IF;
+
+        RETURN NEW;
+    END IF;
+
+    -- State timestamps are server-owned. Ignore caller-supplied rewrites unless
+    -- the opt-in state actually changes below.
+    NEW.opted_in_at = OLD.opted_in_at;
+    NEW.opted_out_at = OLD.opted_out_at;
+
+    -- Explicit opt-outs always override opt-in state.
+    IF NEW.explicit_optout IS TRUE THEN
+        NEW.opted_in = false;
+        IF OLD.explicit_optout IS DISTINCT FROM TRUE
+           OR OLD.opted_in IS TRUE
+           OR NEW.opted_out_at IS NULL THEN
+            NEW.opted_out_at = NOW();
+        END IF;
+    -- Track opt-in/opt-out timestamps.
+    ELSIF OLD.opted_in IS FALSE AND NEW.opted_in IS TRUE THEN
         NEW.opted_in_at = NOW();
         NEW.opted_out_at = NULL;
         NEW.explicit_optout = false; -- Clear explicit opt-out when opting in
         NEW.opt_out_reason = NULL;
-    ELSIF OLD.opted_in = true AND NEW.opted_in = false THEN
+    ELSIF OLD.opted_in IS TRUE AND NEW.opted_in IS FALSE THEN
         NEW.opted_out_at = NOW();
+    ELSIF NEW.opted_in IS TRUE AND NEW.opted_in_at IS NULL THEN
+        -- Repair legacy opted-in rows the next time they are updated.
+        NEW.opted_in_at = COALESCE(OLD.opted_in_at, OLD.created_at, OLD.updated_at, NOW());
     END IF;
-    
-    -- Handle explicit opt-out
-    IF OLD.explicit_optout = false AND NEW.explicit_optout = true THEN
-        NEW.opted_in = false;
-        NEW.opted_out_at = NOW();
-    END IF;
-    
+
     RETURN NEW;
 END;
 $$;
 
 ALTER FUNCTION "public"."update_optin_updated_at"() OWNER TO "postgres";
+
+
+-- Explicit opt-outs are a hard scrape deny. Resolve username-only legacy rows
+-- when possible, and never remove a block automatically because the same table
+-- also contains administrator-managed blocks.
+CREATE OR REPLACE FUNCTION "public"."propagate_explicit_optout_scrape_block"() RETURNS "trigger"
+    LANGUAGE "plpgsql" SECURITY DEFINER
+    SET "search_path" TO ''
+    AS $$
+DECLARE
+    v_account_id text;
+BEGIN
+    IF NEW.explicit_optout IS NOT TRUE THEN
+        RETURN NEW;
+    END IF;
+
+    v_account_id := NULLIF(BTRIM(NEW.twitter_user_id), '');
+
+    IF v_account_id IS NULL AND NULLIF(BTRIM(NEW.username), '') IS NOT NULL THEN
+        SELECT a.account_id
+        INTO v_account_id
+        FROM public.all_account AS a
+        WHERE LOWER(a.username) = LOWER(BTRIM(NEW.username))
+        ORDER BY a.updated_at DESC NULLS LAST
+        LIMIT 1;
+    END IF;
+
+    IF v_account_id IS NOT NULL THEN
+        INSERT INTO tes.blocked_scraping_users (account_id)
+        VALUES (v_account_id)
+        ON CONFLICT (account_id) DO NOTHING;
+    END IF;
+
+    RETURN NEW;
+END;
+$$;
+
+ALTER FUNCTION "public"."propagate_explicit_optout_scrape_block"() OWNER TO "postgres";
 
 
 -- Generic updated_at column maintainer
@@ -2446,6 +2510,7 @@ BEGIN
         FROM public.tweets t
         LEFT JOIN public.archive_upload au ON t.archive_upload_id = au.id
         WHERE (search_query = '' OR search_query IS NULL OR t.fts @@ to_tsquery('english', search_query))
+          AND t.full_text NOT LIKE 'RT @%'
           AND (from_account_id IS NULL OR t.account_id = from_account_id)
           AND (to_account_id IS NULL OR t.reply_to_user_id = to_account_id)
           AND (since_date IS NULL OR t.created_at >= since_date)
@@ -2544,6 +2609,7 @@ BEGIN
         FROM public.tweets t
         LEFT JOIN public.archive_upload au ON t.archive_upload_id = au.id
         WHERE to_tsvector('simple'::regconfig, t.full_text) @@ phraseto_tsquery('simple'::regconfig, exact_phrase)
+          AND t.full_text NOT LIKE 'RT @%'
           AND (from_account_id IS NULL OR t.account_id = from_account_id)
           AND (to_account_id IS NULL OR t.reply_to_user_id = to_account_id)
           AND (since_date IS NULL OR t.created_at >= since_date)
@@ -2909,3 +2975,43 @@ BEGIN
 END;
 $$;
 ALTER FUNCTION public.admin_enqueue_delete_with_export(text, text, text, uuid) OWNER TO postgres;
+
+-- admin_list_recent_delete_jobs: service-role-only read bridge for the
+-- dashboard. private.admin_jobs remains outside PostgREST's exposed schemas.
+CREATE OR REPLACE FUNCTION public.admin_list_recent_delete_jobs(
+  p_limit integer DEFAULT 20
+) RETURNS TABLE (
+  job_key uuid,
+  status text,
+  account_id text,
+  username text,
+  reason text,
+  created_at timestamptz,
+  updated_at timestamptz,
+  error text
+)
+LANGUAGE sql
+STABLE
+SECURITY DEFINER
+SET search_path = ''
+AS $$
+  SELECT
+    j.key AS job_key,
+    j.status,
+    j.args->>'account_id' AS account_id,
+    j.args->>'username' AS username,
+    j.args->>'reason' AS reason,
+    j.created_at,
+    j.updated_at,
+    j.args->>'error' AS error
+  FROM private.admin_jobs AS j
+  WHERE j.job_name = 'admin_delete_with_export'
+  ORDER BY j.updated_at DESC, j.created_at DESC
+  LIMIT LEAST(GREATEST(COALESCE(p_limit, 20), 1), 100);
+$$;
+ALTER FUNCTION public.admin_list_recent_delete_jobs(integer) OWNER TO postgres;
+
+REVOKE ALL ON FUNCTION public.admin_list_recent_delete_jobs(integer)
+  FROM PUBLIC, anon, authenticated;
+GRANT EXECUTE ON FUNCTION public.admin_list_recent_delete_jobs(integer)
+  TO service_role;

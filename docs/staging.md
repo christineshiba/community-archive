@@ -28,7 +28,34 @@ STAGING_DEV_LOGIN_USERNAME=alice_dev
 STAGING_DEV_LOGIN_PROVIDER_ID=mock_alice
 STAGING_DEV_LOGIN_DISPLAY_NAME=Alice Staging
 ALLOW_STAGING_ADMIN_ON_PROD_SUPABASE=false
+
+# Staging-only ClickHouse analytics lab (server-side secrets)
+ENABLE_CLICKHOUSE_LAB=true
+CLICKHOUSE_ANALYTICS_API_URL=https://analytics.community-archive.org/analytics
+CLICKHOUSE_SEARCH_API_URL=https://analytics.community-archive.org
+CLICKHOUSE_ANALYTICS_API_TOKEN=<shared-staging-gateway-token>
+
+# Opt-in application reads. Leave false until the dedicated /search endpoint is deployed.
+ENABLE_CLICKHOUSE_READS=false
+NEXT_PUBLIC_ENABLE_CLICKHOUSE_SEARCH=false
 ```
+
+### Testing the portal with production public data
+
+The portal's totals, trends, and observed-stream counts come from the
+server-side ClickHouse analytics gateway. Its recent tweet and banger rows can
+optionally use a separate read-only Supabase source:
+
+```env
+PORTAL_READ_SUPABASE_URL=<production-supabase-url>
+PORTAL_READ_SUPABASE_ANON_KEY=<production-anon-key>
+```
+
+Scope these overrides to the portal PR/staging branch. Keep
+`NEXT_PUBLIC_SUPABASE_URL`, `NEXT_PUBLIC_SUPABASE_ANON_KEY`, and
+`SUPABASE_SERVICE_ROLE` pointed at staging so login, uploads, admin tools, and
+all writes remain isolated. `PORTAL_READ_SUPABASE_ANON_KEY` is server-only and
+must be the public anonymous key, never the production service-role key.
 
 The default staging login identity is configured via env:
 
@@ -43,6 +70,12 @@ Do not commit the real password. The bootstrap script below writes it to an igno
 
 The server route always refuses staging dev login against the known production
 Supabase project. No environment flag can override that production guard.
+
+The same production-project refusal applies to `/clickhouse` and its API proxy:
+even if `ENABLE_CLICKHOUSE_LAB=true` is accidentally added to Production, the
+lab returns 404 when `NEXT_PUBLIC_SUPABASE_URL` points at the production
+Supabase project. The browser only talks to `/api/clickhouse/*`; the bearer
+token and upstream analytics URL remain server-side Vercel variables.
 
 When `ENABLE_STAGING_DEV_LOGIN=true` and the deployment is not pointed at the known production Supabase host, `/admin` is available to signed-in staging mock users. Production remains restricted to the Twitter username `exgenesis`.
 
@@ -112,6 +145,14 @@ For PR-created Vercel Preview deployments, add the values from `.env.staging.gen
 - `STAGING_DEV_LOGIN_USERNAME`
 - `STAGING_DEV_LOGIN_PROVIDER_ID`
 - `STAGING_DEV_LOGIN_DISPLAY_NAME`
+- `ENABLE_CLICKHOUSE_LAB=true`
+- `CLICKHOUSE_ANALYTICS_API_URL`
+- `CLICKHOUSE_SEARCH_API_URL` (the standalone mirror-search gateway; falls
+  back to `CLICKHOUSE_ANALYTICS_API_URL` only when omitted)
+- `CLICKHOUSE_ANALYTICS_API_TOKEN`
+- `ENABLE_CLICKHOUSE_READS=false` (set true when testing homepage/search reads)
+- `NEXT_PUBLIC_ENABLE_CLICKHOUSE_SEARCH=false` (set true in the same build that
+  should try ClickHouse text search)
 
 After updating Preview env vars, redeploy the PR preview so the new values are picked up.
 
